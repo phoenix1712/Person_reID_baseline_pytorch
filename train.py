@@ -24,6 +24,30 @@ from shutil import copyfile
 
 version =  torch.__version__
 
+#PN GAN code integration
+from torch.autograd import Variable
+import network
+import dataset
+from config import cfg
+
+# Load Network
+def load_network(model_path):
+    os.environ["CUDA_VISIBLE_DEVICES"] = cfg.TEST.GPU_ID
+    print ('###################################')
+    print ("#####      Load Network      #####")
+    print ('###################################')
+
+    nets = []
+    netG = network.Res_Generator(cfg.TRAIN.ngf, cfg.TRAIN.num_resblock)
+    netG.load_state_dict(torch.load(model_path)['state_dict'])
+
+    nets.append(netG)
+    for net in nets:
+        net.cuda()
+
+    print ('Finished !')
+    return nets
+
 ######################################################################
 # Options
 # --------
@@ -37,7 +61,26 @@ parser.add_argument('--batchsize', default=32, type=int, help='batchsize')
 parser.add_argument('--erasing_p', default=0, type=float, help='Random Erasing probability, in [0,1]')
 parser.add_argument('--use_dense', action='store_true', help='use densenet121' )
 parser.add_argument('--PCB', action='store_true', help='use PCB+ResNet50' )
+parser.add_argument('--use_gan', action='store_true', help="Use pose normalization or not")
 opt = parser.parse_args()
+
+global pn_gan
+global poses
+    
+if args.use_gan:
+        pn_gan,poses = initialize_PN_GAN();
+        
+pn_gan=''
+poses =''
+
+def initialize_PN_GAN():
+    model_path = './G_2.pkl'
+    pn_gan = load_network(model_path)
+    pose_data = dataset.Pose_Loader(pose_path='./poses/',transform=dataset.val_transform(), loader=dataset.val_loader)
+    use_gpu = torch.cuda.is_available()
+    pin_memory = True if use_gpu else False    
+    return pn_gan[0], DataLoader(pose_data,batch_size=1,shuffle=False,num_workers=1,pin_memory=pin_memory)    
+
 
 data_dir = opt.data_dir
 name = opt.name
@@ -178,7 +221,37 @@ def train_model(model, criterion, optimizer, scheduler, num_epochs=25):
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
+                
+                if args.use_gan:
+                    for pose_idx, pose_img in enumerate(poses):
+                        if use_gpu:
+                            pose_img = Variable(pose_img).cuda()
+                        tgt_img = pn_gan(Variable(inputs).cuda(),pose_img)
+                        
+                        outputs = model(tgt_img)
+                        if not opt.PCB:
+                            _, preds = torch.max(outputs.data, 1)
+                            loss = criterion(outputs, labels)
+                        else:
+                            part = {}
+                            sm = nn.Softmax(dim=1)
+                            num_part = 6
+                            for i in range(num_part):
+                                part[i] = outputs[i]
 
+                            score = sm(part[0]) + sm(part[1]) +sm(part[2]) + sm(part[3]) +sm(part[4]) +sm(part[5])
+                            _, preds = torch.max(score.data, 1)
+
+                            loss = criterion(part[0], labels)
+                            for i in range(num_part-1):
+                                loss += criterion(part[i+1], labels)
+
+                        # backward + optimize only if in training phase
+                        if phase == 'train':
+                            loss.backward()
+                            optimizer.step()
+                        
+                
                 # forward
                 outputs = model(inputs)
                 if not opt.PCB:
